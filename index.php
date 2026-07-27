@@ -7,26 +7,24 @@ ini_set('memory_limit', '512M');
 // إعدادات CORS
 header("Access-Control-Allow-Origin: *");
 header("Access-Control-Allow-Methods: GET, HEAD, OPTIONS");
-header("Access-Control-Allow-Headers: Range, Content-Range");
+header("Access-Control-Allow-Headers: Range, Content-Type, Content-Range");
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     http_response_code(200);
     exit;
 }
 
-// قراءة المسار المطلوبة
+// 1. استخراج الـ File Key من مسار الرابط أو الـ Query
 $uri = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
 
-// الصفحة الرئيسية أو فحص الصحة
 if ($uri === '/' || $uri === '/health') {
     header("Content-Type: application/json");
     echo json_encode(["status" => "ok", "service" => "MediaFire PHP Proxy"]);
     exit;
 }
 
-// استخراج الـ File Key من مسارات مختلفة مثل: /v/KEY.mp4 أو index.php?key=KEY
 $file_key = null;
-if (preg_match('/^\/(?:v|stream|play)\/([a-zA-Z0-9]+)(?:\.mp4)?$/', $uri, $matches)) {
+if (preg_match('#/(?:v|stream|play)/([a-zA-Z0-9]+)(?:\.mp4)?$#', $uri, $matches)) {
     $file_key = $matches[1];
 } else {
     $file_key = $_GET['key'] ?? null;
@@ -34,11 +32,11 @@ if (preg_match('/^\/(?:v|stream|play)\/([a-zA-Z0-9]+)(?:\.mp4)?$/', $uri, $match
 
 if (!$file_key) {
     http_response_code(400);
-    echo "File key is required.";
+    echo "Error: File key is missing.";
     exit;
 }
 
-// دالة جلب رابط التحميل المباشر
+// 2. دالة لاستخراج رابط التحميل المباشر مع كاش بسيط
 function get_mediafire_direct_url($key) {
     $cache_file = sys_get_temp_dir() . "/mf_{$key}.json";
     
@@ -71,47 +69,66 @@ $info = get_mediafire_direct_url($file_key);
 
 if (!$info) {
     http_response_code(404);
-    echo "Could not resolve MediaFire download URL.";
+    echo "Error: Could not extract download URL from MediaFire.";
     exit;
 }
 
 $download_url = $info['url'];
 
-// طلبات HEAD
-if ($_SERVER['REQUEST_METHOD'] === 'HEAD') {
-    $ch = curl_init($download_url);
-    curl_setopt($ch, CURLOPT_NOBODY, true);
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_HEADER, true);
-    curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-    curl_setopt($ch, CURLOPT_USERAGENT, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126.0.0.0 Safari/537.36');
-    curl_exec($ch);
-    
-    $size = curl_getinfo($ch, CURLINFO_CONTENT_LENGTH_DOWNLOAD);
-    curl_close($ch);
-
-    header("Content-Type: video/mp4");
-    header("Accept-Ranges: bytes");
-    if ($size > 0) {
-        header("Content-Length: " . $size);
-    }
-    exit;
-}
-
-// البث والممر التفاعلي (Range Stream)
-$headers = [
+// 3. تجهيز الطلب الموجه لـ MediaFire
+$request_headers = [
     'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126.0.0.0 Safari/537.36',
     'Referer: https://www.mediafire.com/file/' . $file_key . '/file'
 ];
 
 if (isset($_SERVER['HTTP_RANGE'])) {
-    $headers[] = 'Range: ' . $_SERVER['HTTP_RANGE'];
+    $request_headers[] = 'Range: ' . $_SERVER['HTTP_RANGE'];
 }
 
 $ch = curl_init();
 curl_setopt($ch, CURLOPT_URL, $download_url);
-curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+curl_setopt($ch, CURLOPT_HTTPHEADER, $request_headers);
 curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+
+// معالجة HEAD Request
+if ($_SERVER['REQUEST_METHOD'] === 'HEAD') {
+    curl_setopt($ch, CURLOPT_NOBODY, true);
+}
+
+// نقل الـ Headers القادمة من MediaFire مباشرة إلى العميل
+curl_setopt($ch, CURLOPT_HEADERFUNCTION, function($curl, $header_line) {
+    $len = strlen($header_line);
+    $header = trim($header_line);
+    
+    if (empty($header)) {
+        return $len;
+    }
+
+    // تمرير الهيدرز الأساسية لتشغيل الفيديو والترجيع
+    if (preg_match('/^(Content-Type|Content-Range|Content-Length|Accept-Ranges):/i', $header)) {
+        header($header);
+    }
+    
+    return $len;
+});
+
+// تمرير بيانات الفيديو كبث حي دون تخزين في الذاكرة
+curl_setopt($ch, CURLOPT_WRITEFUNCTION, function($curl, $data) {
+    echo $data;
+    ob_flush();
+    flush();
+    return strlen($data);
+});
+
+curl_exec($ch);
+
+$http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+if ($http_code && $http_code !== 200) {
+    http_response_code($http_code);
+}
+
+curl_close($ch);
 curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
 
 curl_setopt($ch, CURLOPT_HEADERFUNCTION, function($curl, $header_line) {
